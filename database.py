@@ -1,41 +1,43 @@
 from __future__ import annotations
 
-import sqlite3
+import os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+import asyncpg
+from dotenv import load_dotenv
 
-DB_PATH = Path(__file__).with_name("bot_limits.db")
+load_dotenv()  # .env faylini shu yerning o'zida ham yuklaymiz — import tartibiga bog'liq bo'lmasin
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _connect() -> sqlite3.Connection:
-    connection = sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA foreign_keys=ON")
-    return connection
+async def _get_connection() -> asyncpg.Connection:
+    database_url = os.getenv("DATABASE_URL")  # HAR SAFAR yangidan o'qiladi, module yuklanganda emas
+    if not database_url:
+        raise ValueError("DATABASE_URL muhit o'zgaruvchisi topilmadi!")
+
+    url = database_url
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+
+    return await asyncpg.connect(url, ssl="require")
 
 
-def init_db() -> None:
-    connection = _connect()
+async def init_db() -> None:
+    conn = await _get_connection()
     try:
-        connection.executescript(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                joined_at TEXT NOT NULL
+                user_id BIGINT PRIMARY KEY,
+                joined_at TIMESTAMPTZ NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS user_limits (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 service_type TEXT NOT NULL,
-                last_used TEXT NOT NULL,
+                last_used TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (user_id, service_type),
                 FOREIGN KEY (user_id)
                     REFERENCES users(user_id)
@@ -46,7 +48,7 @@ def init_db() -> None:
                 channel_ref TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 url TEXT NOT NULL,
-                added_at TEXT NOT NULL
+                added_at TIMESTAMPTZ NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -55,92 +57,74 @@ def init_db() -> None:
             );
             """
         )
-        connection.commit()
     finally:
-        connection.close()
+        await conn.close()
 
 
-def add_user(user_id: int) -> None:
-    connection = _connect()
+async def add_user(user_id: int) -> None:
+    conn = await _get_connection()
     try:
-        connection.execute(
+        await conn.execute(
             """
-            INSERT OR IGNORE INTO users (
-                user_id,
-                joined_at
-            )
-            VALUES (?, ?)
+            INSERT INTO users (user_id, joined_at)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO NOTHING
             """,
-            (
-                user_id,
-                _now().isoformat(),
-            ),
+            user_id,
+            _now(),
         )
-        connection.commit()
     finally:
-        connection.close()
+        await conn.close()
 
 
-def get_all_users() -> list[int]:
-    connection = _connect()
+async def get_all_users() -> list[int]:
+    conn = await _get_connection()
     try:
-        rows = connection.execute(
+        rows = await conn.fetch(
             """
             SELECT user_id
             FROM users
             ORDER BY user_id
             """
-        ).fetchall()
+        )
     finally:
-        connection.close()
+        await conn.close()
 
     return [int(row["user_id"]) for row in rows]
 
 
-def get_user_count() -> int:
-    connection = _connect()
+async def get_user_count() -> int:
+    conn = await _get_connection()
     try:
-        row = connection.execute(
-            "SELECT COUNT(*) AS count FROM users"
-        ).fetchone()
+        count = await conn.fetchval("SELECT COUNT(*) FROM users")
     finally:
-        connection.close()
+        await conn.close()
 
-    return int(row["count"])
+    return int(count) if count is not None else 0
 
 
-def get_remaining_cooldown(user_id: int, service_type: str) -> float | None:
-    """Non-mutating check: returns None if the user is allowed to use this
-    service right now, or the remaining cooldown in hours if not.
-
-    Unlike check_and_update_limit(), this does NOT record a new usage —
-    it's meant to be called as an early, cheap check (e.g. right when the
-    user taps a service button) BEFORE we bother asking them for a topic.
-    """
+async def get_remaining_cooldown(user_id: int, service_type: str) -> float | None:
     now = _now()
     cooldown = timedelta(hours=24)
 
-    connection = _connect()
+    conn = await _get_connection()
     try:
-        row = connection.execute(
+        last_used = await conn.fetchval(
             """
             SELECT last_used
             FROM user_limits
-            WHERE user_id = ?
-              AND service_type = ?
+            WHERE user_id = $1
+              AND service_type = $2
             """,
-            (
-                user_id,
-                service_type,
-            ),
-        ).fetchone()
+            user_id,
+            service_type,
+        )
     finally:
-        connection.close()
+        await conn.close()
 
-    if not row:
+    if not last_used:
         return None
 
-    last_used = datetime.fromisoformat(row["last_used"])
     elapsed = now - last_used
 
     if elapsed < cooldown:
@@ -150,196 +134,148 @@ def get_remaining_cooldown(user_id: int, service_type: str) -> float | None:
     return None
 
 
-def check_and_update_limit(
+async def check_and_update_limit(
     user_id: int,
     service_type: str,
 ) -> tuple[bool, float]:
-    """Check the cooldown and, if allowed, immediately record usage.
-
-    NOTE: if the caller later fails to deliver the result (e.g. the AI
-    generation or file creation raises), it should call release_limit()
-    with the same arguments so the user isn't charged for a failed attempt.
-    """
     now = _now()
     cooldown = timedelta(hours=24)
 
-    add_user(user_id)
+    await add_user(user_id)
 
-    connection = _connect()
+    conn = await _get_connection()
+    can_proceed = True
+    remaining_time = 0.0
+
     try:
-        connection.execute("BEGIN IMMEDIATE")
-
-        row = connection.execute(
-            """
-            SELECT last_used
-            FROM user_limits
-            WHERE user_id = ?
-              AND service_type = ?
-            """,
-            (
+        async with conn.transaction():
+            last_used = await conn.fetchval(
+                """
+                SELECT last_used
+                FROM user_limits
+                WHERE user_id = $1
+                  AND service_type = $2
+                FOR UPDATE
+                """,
                 user_id,
                 service_type,
-            ),
-        ).fetchone()
-
-        if row:
-            last_used = datetime.fromisoformat(
-                row["last_used"]
             )
-            elapsed = now - last_used
 
-            if elapsed < cooldown:
-                remaining = (
-                    cooldown - elapsed
-                ).total_seconds() / 3600
+            if last_used:
+                elapsed = now - last_used
+                if elapsed < cooldown:
+                    remaining = (cooldown - elapsed).total_seconds() / 3600
+                    can_proceed = False
+                    remaining_time = max(0.1, remaining)
 
-                connection.rollback()
-
-                return False, max(0.1, remaining)
-
-        connection.execute(
-            """
-            INSERT INTO user_limits (
-                user_id,
-                service_type,
-                last_used
-            )
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, service_type)
-            DO UPDATE SET last_used = excluded.last_used
-            """,
-            (
-                user_id,
-                service_type,
-                now.isoformat(),
-            ),
-        )
-
-        connection.commit()
+            if can_proceed:
+                await conn.execute(
+                    """
+                    INSERT INTO user_limits (user_id, service_type, last_used)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (user_id, service_type)
+                    DO UPDATE SET last_used = EXCLUDED.last_used
+                    """,
+                    user_id,
+                    service_type,
+                    now,
+                )
     finally:
-        connection.close()
+        await conn.close()
 
-    return True, 0.0
+    return can_proceed, remaining_time
 
 
-def release_limit(user_id: int, service_type: str) -> None:
-    """Undo a limit charge made by check_and_update_limit.
-
-    Call this when generation/delivery failed after the limit was already
-    recorded, so the user isn't punished with a 24h cooldown for nothing.
-    """
-    connection = _connect()
+async def release_limit(user_id: int, service_type: str) -> None:
+    conn = await _get_connection()
     try:
-        connection.execute(
+        await conn.execute(
             """
             DELETE FROM user_limits
-            WHERE user_id = ?
-              AND service_type = ?
+            WHERE user_id = $1
+              AND service_type = $2
             """,
-            (
-                user_id,
-                service_type,
-            ),
+            user_id,
+            service_type,
         )
-        connection.commit()
     finally:
-        connection.close()
+        await conn.close()
 
 
-def add_channel(channel_ref: str, title: str, url: str) -> None:
-    """Add or update a required subscription channel."""
-    connection = _connect()
+async def add_channel(channel_ref: str, title: str, url: str) -> None:
+    conn = await _get_connection()
     try:
-        connection.execute(
+        await conn.execute(
             """
             INSERT INTO channels (channel_ref, title, url, added_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(channel_ref)
-            DO UPDATE SET title = excluded.title, url = excluded.url
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (channel_ref)
+            DO UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url
             """,
-            (
-                channel_ref,
-                title,
-                url,
-                _now().isoformat(),
-            ),
+            channel_ref,
+            title,
+            url,
+            _now(),
         )
-        connection.commit()
     finally:
-        connection.close()
+        await conn.close()
 
 
-def remove_channel(channel_ref: str) -> bool:
-    """Remove a required subscription channel. Returns True if it existed."""
-    connection = _connect()
+async def remove_channel(channel_ref: str) -> bool:
+    conn = await _get_connection()
     try:
-        cursor = connection.execute(
-            "DELETE FROM channels WHERE channel_ref = ?",
-            (channel_ref,),
+        result = await conn.execute(
+            "DELETE FROM channels WHERE channel_ref = $1",
+            channel_ref,
         )
-        connection.commit()
-        return cursor.rowcount > 0
+        rows_affected = int(result.split(" ")[1])
+        return rows_affected > 0
     finally:
-        connection.close()
+        await conn.close()
 
 
-def get_channels() -> list[tuple[str, str, str]]:
-    """Returns list of (channel_ref, title, url) tuples."""
-    connection = _connect()
+async def get_channels() -> list[tuple[str, str, str]]:
+    conn = await _get_connection()
     try:
-        rows = connection.execute(
+        rows = await conn.fetch(
             "SELECT channel_ref, title, url FROM channels ORDER BY added_at"
-        ).fetchall()
+        )
     finally:
-        connection.close()
+        await conn.close()
 
     return [(row["channel_ref"], row["title"], row["url"]) for row in rows]
 
 
-# ---------------------------------------------------------------------------
-# Settings — hozircha faqat obuna tekshirish rejimi uchun ishlatiladi.
-#
-#   "strict" — bot get_chat_member orqali obunani chinakam tekshiradi.
-#              Buning uchun bot HAR BIR kanalda ADMIN bo'lishi shart
-#              (bu Telegram API'ning o'z cheklovi, botlar kanalga faqat
-#              admin sifatida qo'shiladi — buni kod bilan aylanib o'tib
-#              bo'lmaydi).
-#   "soft"   — foydalanuvchiga "obuna bo'ling" tugmalari ko'rsatiladi,
-#              lekin haqiqiy tekshiruv qilinmaydi (ishonchga asoslangan).
-#              Bu rejimda botni HECH QAYERDA admin qilish shart emas.
-# ---------------------------------------------------------------------------
-
 _DEFAULT_SUBSCRIPTION_MODE = "strict"
 
 
-def get_subscription_mode() -> str:
-    connection = _connect()
+async def get_subscription_mode() -> str:
+    conn = await _get_connection()
     try:
-        row = connection.execute(
+        val = await conn.fetchval(
             "SELECT value FROM settings WHERE key = 'subscription_mode'"
-        ).fetchone()
+        )
     finally:
-        connection.close()
+        await conn.close()
 
-    if row and row["value"] in {"strict", "soft"}:
-        return row["value"]
+    if val and val in {"strict", "soft"}:
+        return val
     return _DEFAULT_SUBSCRIPTION_MODE
 
 
-def set_subscription_mode(mode: str) -> None:
+async def set_subscription_mode(mode: str) -> None:
     if mode not in {"strict", "soft"}:
         raise ValueError("mode faqat 'strict' yoki 'soft' bo'lishi mumkin")
 
-    connection = _connect()
+    conn = await _get_connection()
     try:
-        connection.execute(
+        await conn.execute(
             """
             INSERT INTO settings (key, value)
-            VALUES ('subscription_mode', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            VALUES ('subscription_mode', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             """,
-            (mode,),
+            mode,
         )
-        connection.commit()
     finally:
-        connection.close()
+        await conn.close()

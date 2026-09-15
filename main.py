@@ -106,14 +106,14 @@ def parse_env_channels() -> list[tuple[str, str]]:
     return channels
 
 
-def migrate_env_channels_if_needed() -> None:
+async def migrate_env_channels_if_needed() -> None:
     """One-time migration: if the DB has no channels yet but .env has
     REQUIRED_CHANNELS set, copy them into the DB so nothing is lost."""
-    if get_channels():
+    if await get_channels():
         return
     for name, url in parse_env_channels():
         channel_ref = name if name.startswith("@") else f"@{name.lstrip('@')}"
-        add_channel(channel_ref, name, url)
+        await add_channel(channel_ref, name, url)
 
 
 class WorkState(StatesGroup):
@@ -153,13 +153,13 @@ async def get_missing_channels(bot: Bot, user_id: int) -> list[tuple[str, str, s
     """Foydalanuvchi hali obuna bo'lmagan majburiy kanallar ro'yxatini
     qaytaradi (masalan, 3 tadan 2 tasiga obuna bo'lgan bo'lsa, faqat
     qolgan 1 tasini qaytaradi — barcha 3 tasini emas)."""
-    channels = get_channels()
+    channels = await get_channels()
     if not channels:
         return []
 
     # "soft" rejimda haqiqiy tekshiruv qilinmaydi — shuning uchun bot
     # kanallarda admin bo'lishi shart emas.
-    if get_subscription_mode() == "soft":
+    if await get_subscription_mode() == "soft":
         return []
 
     missing: list[tuple[str, str, str]] = []
@@ -902,8 +902,8 @@ def build_presentation(topic: str, data: dict) -> Path:
     return path
 
 
-def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    mode = get_subscription_mode()
+async def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    mode = await get_subscription_mode()
     mode_label = "🔒 Qattiq (admin talab qiladi)" if mode == "strict" else "🔓 Yumshoq (admin talab qilmaydi)"
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="📢 Reklama yuborish", callback_data="adm:ads"))
@@ -921,8 +921,8 @@ async def admin_handler(message: Message) -> None:
         return
 
     await message.answer(
-        f"📊 Admin panel.\nFoydalanuvchilar: {get_user_count()}\n\nKerakli bo'limni tanlang:",
-        reply_markup=admin_panel_keyboard(),
+        f"📊 Admin panel.\nFoydalanuvchilar: {await get_user_count()}\n\nKerakli bo'limni tanlang:",
+        reply_markup=await admin_panel_keyboard(),
     )
 
 
@@ -943,7 +943,7 @@ async def admin_menu_callback(callback: CallbackQuery, state: FSMContext) -> Non
     elif action == "addch":
         await callback.answer()
         await state.set_state(WorkState.waiting_for_channel_add)
-        mode = get_subscription_mode()
+        mode = await get_subscription_mode()
         if callback.message:
             if mode == "strict":
                 await callback.message.answer(
@@ -966,7 +966,7 @@ async def admin_menu_callback(callback: CallbackQuery, state: FSMContext) -> Non
 
     elif action == "rmch":
         await callback.answer()
-        channels = get_channels()
+        channels = await get_channels()
         if not channels:
             if callback.message:
                 await callback.message.answer("Hozircha hech qanday majburiy kanal yo'q.")
@@ -980,7 +980,7 @@ async def admin_menu_callback(callback: CallbackQuery, state: FSMContext) -> Non
 
     elif action == "listch":
         await callback.answer()
-        channels = get_channels()
+        channels = await get_channels()
         if not channels:
             text = "Hozircha hech qanday majburiy kanal yo'q."
         else:
@@ -990,15 +990,15 @@ async def admin_menu_callback(callback: CallbackQuery, state: FSMContext) -> Non
             await callback.message.answer(text)
 
     elif action == "togglemode":
-        current = get_subscription_mode()
+        current = await get_subscription_mode()
         new_mode = "soft" if current == "strict" else "strict"
-        set_subscription_mode(new_mode)
+        await set_subscription_mode(new_mode)
         if new_mode == "soft":
             await callback.answer("Yumshoq rejim yoqildi — admin talab qilinmaydi", show_alert=True)
         else:
             await callback.answer("Qattiq rejim yoqildi — obuna chinakam tekshiriladi", show_alert=True)
         if callback.message:
-            await callback.message.edit_reply_markup(reply_markup=admin_panel_keyboard())
+            await callback.message.edit_reply_markup(reply_markup=await admin_panel_keyboard())
 
 
 @router.callback_query(F.data.startswith("rmch:"))
@@ -1008,7 +1008,7 @@ async def remove_channel_callback(callback: CallbackQuery) -> None:
         return
 
     channel_ref = callback.data.split(":", 1)[1]
-    removed = remove_channel(channel_ref)
+    removed = await remove_channel(channel_ref)
     await callback.answer("✅ O'chirildi" if removed else "Topilmadi", show_alert=True)
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -1055,7 +1055,7 @@ async def channel_add_handler(message: Message, state: FSMContext, bot: Bot) -> 
         await message.answer("Kanal postini forward qiling yoki @username yuboring.")
         return
 
-    mode = get_subscription_mode()
+    mode = await get_subscription_mode()
 
     if mode == "strict":
         try:
@@ -1077,7 +1077,7 @@ async def channel_add_handler(message: Message, state: FSMContext, bot: Bot) -> 
             )
             return
 
-    add_channel(channel_ref, title, url)
+    await add_channel(channel_ref, title, url)
     if mode == "strict":
         await message.answer(
             f"✅ Kanal qo'shildi: {title}\n"
@@ -1095,7 +1095,7 @@ async def channel_add_handler(message: Message, state: FSMContext, bot: Bot) -> 
 async def start_handler(message: Message, bot: Bot) -> None:
     if not message.from_user:
         return
-    add_user(message.from_user.id)
+    await add_user(message.from_user.id)
     if not await require_subscription(message, bot):
         return
     await message.answer("Assalomu alaykum. Kerakli xizmatni tanlang:", reply_markup=main_keyboard())
@@ -1135,7 +1135,7 @@ async def service_handler(message: Message, state: FSMContext, bot: Bot) -> None
     # soat ichida shu xizmatdan qayta foydalanolmasa, mavzuni yozishga
     # umuman vaqt sarflamasin va darhol qancha kutish kerakligini bilsin.
     if user_id != ADMIN_ID:
-        remaining = get_remaining_cooldown(user_id, service)
+        remaining = await get_remaining_cooldown(user_id, service)
         if remaining is not None:
             await message.answer(
                 f"Bu xizmatdan qayta foydalanish uchun {format_remaining(remaining)}dan keyin urinib ko'ring."
@@ -1165,7 +1165,7 @@ async def topic_handler(message: Message, state: FSMContext) -> None:
     if user_id == ADMIN_ID:
         allowed, remaining = True, 0.0
     else:
-        allowed, remaining = check_and_update_limit(user_id, service)
+        allowed, remaining = await check_and_update_limit(user_id, service)
     if not allowed:
         await message.answer(f"Bu xizmatdan qayta foydalanish uchun {format_remaining(remaining)}dan keyin urinib ko'ring.")
         await state.clear()
@@ -1191,7 +1191,8 @@ async def topic_handler(message: Message, state: FSMContext) -> None:
 
     except Exception as e:
         logger.exception("Generation failed: %s", e)
-        release_limit(user_id, service)
+        if user_id != ADMIN_ID:
+            await release_limit(user_id, service)
         await status_msg.delete()
         await message.answer(
             "Kechirasiz, materialni yaratishda xatolik yuz berdi. "
@@ -1214,7 +1215,7 @@ async def ad_handler(message: Message, state: FSMContext, bot: Bot) -> None:
         return
 
     await state.clear()
-    users = get_all_users()
+    users = await get_all_users()
     sent = 0
     failed = 0
     await message.answer("🚀 Reklama tarqatilmoqda...")
@@ -1244,8 +1245,8 @@ async def main() -> None:
     if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
         raise RuntimeError("BOT_TOKEN, GEMINI_API_KEY va ADMIN_ID .env faylida sozlanishi kerak")
 
-    init_db()
-    migrate_env_channels_if_needed()
+    await init_db()
+    await migrate_env_channels_if_needed()
 
     # Slayd yaratish (Gemini so'rovi + rasm generatsiyasi + pptx qurish) va
     # hujjat yaratish (Gemini so'rovi + docx qurish) ikkalasi ham

@@ -4,3 +4,5 @@ python-pptx
 python-docx
 python-dotenv
 aiohttp
+psycopg2-binary
+asyncpg
